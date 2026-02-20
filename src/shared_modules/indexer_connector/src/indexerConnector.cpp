@@ -267,24 +267,44 @@ static inline void extractErrorInfo(const std::string& errorBody, std::string& t
 
 // ------- IndexerConnector methods implementation -------
 
-nlohmann::json IndexerConnector::getAgentDocumentsIds(const std::string& url,
-                                                      const std::string& agentId,
-                                                      const SecureCommunication& secureCommunication) const
+std::unordered_set<std::string> IndexerConnector::getAgentDocumentsIds(
+    const std::string& url,
+    const std::string& agentId,
+    const SecureCommunication& secureCommunication) const
 {
     nlohmann::json postData;
-    nlohmann::json responseJson;
+    std::unordered_set<std::string> remoteIds;
     constexpr auto ELEMENTS_PER_QUERY {10000}; // The max value for queries is 10000 in the wazuh-indexer.
     std::string scrollId;
+    size_t totalHits {0};
 
     postData["query"]["match"]["agent.id"] = agentId;
     postData["size"] = ELEMENTS_PER_QUERY;
     postData["_source"] = nlohmann::json::array({"_id"});
 
     {
-        const auto onSuccess = [&responseJson, &scrollId](const std::string& response)
+        const auto onSuccess = [&remoteIds, &scrollId, &totalHits](const std::string& response)
         {
-            responseJson = nlohmann::json::parse(response);
-            scrollId = responseJson.at("_scroll_id").get_ref<const std::string&>();
+            const auto responseJson = nlohmann::json::parse(response);
+            if (responseJson.is_discarded())
+            {
+                throw std::runtime_error("Invalid JSON response while retrieving agent documents.");
+            }
+
+            if (responseJson.contains("_scroll_id"))
+            {
+                scrollId = responseJson.at("_scroll_id").get_ref<const std::string&>();
+            }
+
+            totalHits = responseJson.at("hits").at("total").at("value").get<size_t>();
+            const auto& hits = responseJson.at("hits").at("hits");
+            for (const auto& hit : hits)
+            {
+                if (hit.contains("_id"))
+                {
+                    remoteIds.emplace(hit.at("_id").get_ref<const std::string&>());
+                }
+            }
         };
 
         const auto onError = [](const std::string& error, const long statusCode, const std::string& errorBody)
@@ -313,56 +333,75 @@ nlohmann::json IndexerConnector::getAgentDocumentsIds(const std::string& url,
             ConfigurationParameters {});
     }
 
-    // If the response have more than ELEMENTS_PER_QUERY elements, we need to scroll.
-    if (responseJson.at("hits").at("total").at("value").get<int>() > ELEMENTS_PER_QUERY)
+    // If there are more than ELEMENTS_PER_QUERY elements, use scroll.
+    if (totalHits > ELEMENTS_PER_QUERY && !scrollId.empty())
     {
         const auto scrollUrl = url + "/_search/scroll";
-        const auto scrollData = R"({"scroll":"1m","scroll_id":")" + scrollId + "\"}";
 
         const auto onError = [](const std::string& error, const long, const std::string& /*errorBody*/)
         {
             throw std::runtime_error(error);
         };
 
-        const auto onSuccess = [&responseJson](const std::string& response)
+        const auto onSuccess = [&remoteIds, &scrollId](const std::string& response)
         {
             auto newResponse = nlohmann::json::parse(response);
-            for (const auto& hit : newResponse.at("hits").at("hits"))
+            if (newResponse.contains("_scroll_id"))
             {
-                responseJson.at("hits").at("hits").push_back(hit);
+                scrollId = newResponse.at("_scroll_id").get_ref<const std::string&>();
+            }
+
+            const auto& hits = newResponse.at("hits").at("hits");
+            for (const auto& hit : hits)
+            {
+                if (hit.contains("_id"))
+                {
+                    remoteIds.emplace(hit.at("_id").get_ref<const std::string&>());
+                }
             }
         };
 
-        while (responseJson.at("hits").at("hits").size() < responseJson.at("hits").at("total").at("value").get<int>())
+        while (remoteIds.size() < totalHits && !scrollId.empty())
         {
+            const auto scrollData = R"({"scroll":"1m","scroll_id":")" + scrollId + "\"}";
+            const auto previousSize = remoteIds.size();
             HTTPRequest::instance().post(RequestParameters {.url = HttpURL(scrollUrl),
                                                             .data = scrollData,
                                                             .secureCommunication = secureCommunication},
                                          PostRequestParameters {.onSuccess = onSuccess, .onError = onError},
                                          ConfigurationParameters {});
+
+            if (remoteIds.size() == previousSize)
+            {
+                break;
+            }
         }
     }
 
     // Delete the scroll id.
-    const auto deleteScrollUrl = url + "/_search/scroll/" + scrollId;
-
-    const auto onError = [&](const std::string& error, const long statusCode, const std::string& errorBody)
+    if (!scrollId.empty())
     {
-        logError(IC_NAME, "%s, status code: %ld, response body: %s.", error.c_str(), statusCode, errorBody.c_str());
-        // print payload
-        logError(IC_NAME, "Url: %s", deleteScrollUrl.c_str());
-    };
-    const auto onSuccess = [](const std::string& response)
-    {
-        logDebug2(IC_NAME, "Response: %s", response.c_str());
-    };
+        const auto deleteScrollUrl = url + "/_search/scroll/" + scrollId;
 
-    HTTPRequest::instance().delete_(
-        RequestParameters {.url = HttpURL(deleteScrollUrl), .secureCommunication = secureCommunication},
-        PostRequestParameters {.onSuccess = onSuccess, .onError = onError},
-        ConfigurationParameters {});
+        const auto onError = [&](const std::string& error, const long statusCode, const std::string& errorBody)
+        {
+            logError(
+                IC_NAME, "%s, status code: %ld, response body: %s.", error.c_str(), statusCode, errorBody.c_str());
+            // print payload
+            logError(IC_NAME, "Url: %s", deleteScrollUrl.c_str());
+        };
+        const auto onSuccess = [](const std::string& response)
+        {
+            logDebug2(IC_NAME, "Response: %s", response.c_str());
+        };
 
-    return responseJson;
+        HTTPRequest::instance().delete_(
+            RequestParameters {.url = HttpURL(deleteScrollUrl), .secureCommunication = secureCommunication},
+            PostRequestParameters {.onSuccess = onSuccess, .onError = onError},
+            ConfigurationParameters {});
+    }
+
+    return remoteIds;
 }
 
 void IndexerConnector::sendBulkReactive(const std::vector<std::pair<std::string, bool>>& actions,
@@ -376,6 +415,7 @@ void IndexerConnector::sendBulkReactive(const std::vector<std::pair<std::string,
     }
 
     std::string bulkData;
+    bulkData.reserve(actions.size() * 96);
     // Iterate over the actions vector and build the bulk data.
     // If the element is marked as deleted, the element will be deleted from the indexer.
     // If the element is not marked as deleted, the element will be added to the indexer.
@@ -463,53 +503,29 @@ void IndexerConnector::sendBulkReactive(const std::vector<std::pair<std::string,
     }
 }
 
-void IndexerConnector::diff(const nlohmann::json& responseJson,
+void IndexerConnector::diff(const std::unordered_set<std::string>& remoteIds,
                             const std::string& agentId,
                             const SecureCommunication& secureCommunication,
                             const std::shared_ptr<ServerSelector>& selector)
 {
-    std::vector<std::pair<std::string, bool>> status;
+    std::unordered_set<std::string> staleRemoteIds {remoteIds};
     std::vector<std::pair<std::string, bool>> actions;
-
-    // Move elements to vector.
-    for (const auto& hit : responseJson.at("hits").at("hits"))
-    {
-        if (hit.contains("_id"))
-        {
-            status.emplace_back(hit.at("_id").get_ref<const std::string&>(), false);
-        }
-    }
+    actions.reserve(staleRemoteIds.size());
 
     // Iterate over the database and check if the element is in the status vector.
-    for (const auto& [key, value] : m_db->seek(agentId))
+    for (const auto& [key, _] : m_db->seek(agentId))
     {
-        bool found {false};
-        for (auto& [id, data] : status)
+        if (staleRemoteIds.erase(key) == 0)
         {
-            // If the element is found, mark it as found.
-            if (key.compare(id) == 0)
-            {
-                data = true;
-                found = true;
-                break;
-            }
-        }
-
-        // If the element is not found, add it to the actions vector. This element will be added to the indexer.
-        if (!found)
-        {
+            // If the element is not found remotely, add it to the actions vector (index operation).
             actions.emplace_back(key, false);
         }
     }
 
-    // Iterate over the status vector and check if the element is marked as not found.
-    // This means that the element is in the indexer but not in the database. To solve this, the element will be deleted
-    for (const auto& [id, data] : status)
+    // Remaining ids are in indexer but not in the local database, so they must be deleted.
+    for (const auto& id : staleRemoteIds)
     {
-        if (!data)
-        {
-            actions.emplace_back(id, true);
-        }
+        actions.emplace_back(id, true);
     }
 
     auto url = selector->getNext();
@@ -941,7 +957,7 @@ IndexerConnector::IndexerConnector(
 
             while (!dataQueue.empty())
             {
-                auto data = dataQueue.front();
+                std::string data = std::move(dataQueue.front());
                 dataQueue.pop();
                 const auto parsedData = nlohmann::json::parse(data, nullptr, false);
                 // If the data is not a valid JSON, log a warning and continue.
@@ -1291,7 +1307,7 @@ IndexerConnector::IndexerConnector(
         {
             while (!dataQueue.empty())
             {
-                auto data = dataQueue.front();
+                std::string data = std::move(dataQueue.front());
                 dataQueue.pop();
                 auto parsedData = nlohmann::json::parse(data);
                 const auto& id = parsedData.at("id").get_ref<const std::string&>();

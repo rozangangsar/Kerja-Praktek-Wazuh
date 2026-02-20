@@ -13,6 +13,7 @@
 #define _INDEXER_CONNECTOR_HPP
 
 #include <json.hpp>
+#include <unordered_set>
 #include <set>
 #include <string>
 
@@ -86,7 +87,7 @@ class EXPORTED IndexerConnector final
      * @param secureCommunication Secure communication.
      * @param selector Server selector.
      */
-    void diff(const nlohmann::json& responseJson,
+    void diff(const std::unordered_set<std::string>& remoteIds,
               const std::string& agentId,
               const SecureCommunication& secureCommunication,
               const std::shared_ptr<ServerSelector>& selector);
@@ -98,9 +99,9 @@ class EXPORTED IndexerConnector final
      * @param secureCommunication Secure communication.
      * @return Agent documents.
      */
-    nlohmann::json getAgentDocumentsIds(const std::string& url,
-                                        const std::string& agentId,
-                                        const SecureCommunication& secureCommunication) const;
+    std::unordered_set<std::string> getAgentDocumentsIds(const std::string& url,
+                                                         const std::string& agentId,
+                                                         const SecureCommunication& secureCommunication) const;
 
     /**
      * @brief Initializing steps before the module starts.

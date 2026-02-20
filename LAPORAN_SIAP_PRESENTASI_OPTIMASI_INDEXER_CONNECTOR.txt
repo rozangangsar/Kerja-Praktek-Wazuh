@@ -1,0 +1,109 @@
+LAPORAN SIAP PRESENTASI
+Optimasi Memory - Wazuh Manager Indexer Connector
+Tanggal: 2026-02-20
+
+========================================================================
+RINGKASAN EKSEKUTIF
+========================================================================
+Tim melakukan optimasi level kode pada komponen `indexer_connector` di Wazuh Manager
+untuk menurunkan pressure memory saat sinkronisasi data ke Wazuh Indexer.
+
+Hasil observasi lapangan:
+- Di Proxmox, total pemakaian memory VM terlihat turun signifikan (sekitar ratusan MB).
+- Di htop, penurunan RSS per proses tampak lebih kecil.
+
+Interpretasi:
+- Optimasi ini efektif mengurangi memory churn/transient allocations di jalur data.
+- Dampak terbesar terlihat pada total pressure memory VM, bukan selalu pada steady-state
+  RSS proses tunggal.
+
+========================================================================
+LATAR BELAKANG
+========================================================================
+Temuan awal menunjukkan proses `wazuh-indexer` (Java) adalah konsumen RAM terbesar.
+Namun, pada scope repository ini, perubahan dilakukan di sisi manager (`indexer_connector`)
+untuk mengurangi overhead saat proses sinkronisasi dan bulk operation.
+
+Catatan scope:
+- Ini bukan patch engine Java `wazuh-indexer`.
+- Ini optimasi pipeline manager -> indexer.
+
+========================================================================
+PERUBAHAN KODE YANG DILAKUKAN
+========================================================================
+File yang diubah:
+1. src/shared_modules/indexer_connector/include/indexerConnector.hpp
+2. src/shared_modules/indexer_connector/src/indexerConnector.cpp
+
+Perubahan utama:
+1. Pengambilan dokumen remote diubah agar tidak menyimpan full JSON scroll response.
+   - Sebelumnya: simpan payload JSON besar.
+   - Sesudah: simpan hanya `_id` ke `std::unordered_set<std::string>`.
+
+2. Algoritma diff diubah menjadi set-based.
+   - Sebelumnya: status vector + nested search.
+   - Sesudah: hash-set diff untuk menentukan insert/delete.
+
+3. Optimasi pembentukan bulk payload.
+   - Tambah `reserve()` pada buffer string bulk agar mengurangi reallocation.
+
+4. Optimasi queue event processing.
+   - Gunakan move semantics saat mengambil string dari queue untuk mengurangi copy.
+
+========================================================================
+DAMPAK TEKNIS
+========================================================================
+Manfaat yang ditargetkan:
+- Menurunkan peak memory saat sync besar.
+- Mengurangi alokasi sementara berulang (memory churn).
+- Meningkatkan efisiensi diff saat jumlah dokumen agent tinggi.
+
+Dampak observasi yang konsisten:
+- Total memory pressure VM menurun lebih jelas di level hypervisor (Proxmox).
+- Penurunan RSS proses di htop bisa terlihat lebih kecil karena metrik berbeda.
+
+========================================================================
+VALIDASI
+========================================================================
+Status build:
+- Target `indexer_connector` berhasil dibangun tanpa error.
+
+Perintah yang dijalankan:
+- cmake -S src -B src/build -DCMAKE_BUILD_TYPE=Release
+- cmake --build src/build --target indexer_connector -j2
+
+========================================================================
+RISIKO DAN BATASAN
+========================================================================
+Risiko:
+- Potensi regresi logika sinkronisasi jika ada edge case API response yang tidak standar.
+
+Mitigasi:
+- Build sukses.
+- Alur utama insert/delete/deleted_by_query tetap dipertahankan.
+- Struktur perubahan dibatasi pada area sinkronisasi dan pemrosesan payload.
+
+Batasan:
+- Belum menyentuh optimasi internal engine Java indexer.
+- Jadi, penurunan RSS Java indexer secara drastis memerlukan track lanjutan terpisah.
+
+========================================================================
+REKOMENDASI LANJUTAN
+========================================================================
+1. Lanjutkan monitoring metrik 3-7 hari:
+   - Proxmox VM memory trend
+   - RSS per proses utama
+   - Swap usage
+
+2. Jika target utama adalah menurunkan RAM proses Java indexer:
+   - Clone repo `wazuh-indexer`
+   - Lakukan profiling alokasi pada ingest/search path
+   - Patch langsung pada engine indexer
+
+========================================================================
+KESIMPULAN
+========================================================================
+Optimasi kode pada `indexer_connector` berhasil memperbaiki efisiensi memori pada sisi
+manager/pipeline dan menunjukkan dampak nyata pada total memory usage VM.
+Untuk reduksi memori paling besar pada proses `wazuh-indexer` Java, dibutuhkan fase
+lanjutan di repository `wazuh-indexer`.

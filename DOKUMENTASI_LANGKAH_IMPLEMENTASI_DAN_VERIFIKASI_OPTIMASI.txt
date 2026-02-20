@@ -1,0 +1,158 @@
+DOKUMENTASI LANGKAH IMPLEMENTASI DAN VERIFIKASI OPTIMASI
+Tanggal: 2026-02-20
+Repository kerja: /home/wazuh/wazuh-dev/Kerja-Praktek-Wazuh
+Scope: Optimasi kode indexer connector pada Wazuh Manager
+
+========================================================================
+1) TUJUAN DOKUMEN
+========================================================================
+Dokumen ini berisi langkah praktis untuk:
+1. Menerapkan perubahan optimasi.
+2. Build modul yang diubah.
+3. Verifikasi dampak resource.
+4. Interpretasi hasil Proxmox vs htop.
+
+========================================================================
+2) PRASYARAT
+========================================================================
+- Berada di repo:
+  /home/wazuh/wazuh-dev/Kerja-Praktek-Wazuh
+- Tool build tersedia (cmake, compiler C++).
+- User punya akses melihat proses sistem (ps, /proc, free).
+
+========================================================================
+3) LANGKAH IMPLEMENTASI KODE
+========================================================================
+
+Langkah 1 - Ubah header interface
+File:
+- src/shared_modules/indexer_connector/include/indexerConnector.hpp
+
+Perubahan:
+- Tambah include <unordered_set>.
+- Ubah signature method:
+  diff(const std::unordered_set<std::string>& remoteIds, ...)
+- Ubah return type:
+  getAgentDocumentsIds(...) -> std::unordered_set<std::string>
+
+Langkah 2 - Ubah implementasi pengambilan dokumen remote
+File:
+- src/shared_modules/indexer_connector/src/indexerConnector.cpp
+Fungsi:
+- getAgentDocumentsIds(...)
+
+Perubahan:
+- Ganti model simpan full JSON response menjadi hanya set ID dokumen.
+- Scroll loop mengumpulkan _id ke unordered_set.
+- Hapus scroll context hanya jika scrollId ada.
+
+Langkah 3 - Ubah algoritma diff
+File:
+- src/shared_modules/indexer_connector/src/indexerConnector.cpp
+Fungsi:
+- diff(...)
+
+Perubahan:
+- Ganti nested compare berbasis vector/status menjadi hash-set based diff.
+- Elemen sisa di remote-set ditandai delete.
+- Elemen lokal yang tidak ada di remote ditandai insert.
+
+Langkah 4 - Kurangi reallocation payload bulk
+File:
+- src/shared_modules/indexer_connector/src/indexerConnector.cpp
+Fungsi:
+- sendBulkReactive(...)
+
+Perubahan:
+- Tambahkan reserve:
+  bulkData.reserve(actions.size() * 96);
+
+Langkah 5 - Kurangi copy string dari queue
+File:
+- src/shared_modules/indexer_connector/src/indexerConnector.cpp
+Lokasi:
+- Lambda processing event queue (dua constructor path)
+
+Perubahan:
+- Gunakan move:
+  std::string data = std::move(dataQueue.front());
+
+========================================================================
+4) LANGKAH BUILD DAN VALIDASI KOMPILASI
+========================================================================
+
+Langkah 1 - Generate build system
+Perintah:
+cmake -S src -B src/build -DCMAKE_BUILD_TYPE=Release
+
+Langkah 2 - Build target yang relevan
+Perintah:
+cmake --build src/build --target indexer_connector -j2
+
+Langkah 3 - Hasil yang diharapkan
+- Build selesai tanpa error.
+- Output akhir memuat:
+  Built target indexer_connector
+
+========================================================================
+5) LANGKAH VERIFIKASI RESOURCE (SEBELUM/SESUDAH)
+========================================================================
+
+A. Snapshot baseline (sebelum deploy)
+1. Cek RAM total:
+   free -h
+2. Cek proses teratas by RSS:
+   ps -eo pid,ppid,cmd,%mem,%cpu,rss,vsz --sort=-rss | head -n 20
+3. Cek proses Java indexer spesifik:
+   cat /proc/<PID_INDEXER>/status | rg "VmRSS|VmSize|RssAnon|Threads"
+4. Simpan screenshot graph Proxmox pada interval beban yang sama.
+
+B. Deploy binary/komponen hasil build ke environment uji
+(Ikuti mekanisme deploy internal proyek)
+
+C. Snapshot sesudah deploy
+Jalankan perintah yang sama seperti baseline pada kondisi load yang setara.
+
+D. Bandingkan
+- Proxmox memory graph (total VM usage)
+- RSS proses utama di htop/ps
+- Jika memungkinkan, catat juga pola swap usage.
+
+========================================================================
+6) INTERPRETASI HASIL (PROXMOX TURUN BESAR, HTOP KECIL)
+========================================================================
+
+Kondisi yang sering terjadi:
+- Proxmox menunjukkan penurunan besar (contoh ~500MB).
+- htop hanya menunjukkan penurunan kecil pada proses tertentu.
+
+Interpretasi:
+- Patch mengurangi memory churn/transient allocations dan pressure total memory,
+  bukan hanya steady-state RSS proses tunggal.
+- Karena itu, total memory VM bisa membaik signifikan walau angka RSS proses di
+  htop tidak berubah banyak.
+
+========================================================================
+7) CHECKLIST PENERIMAAN (ACCEPTANCE CHECKLIST)
+========================================================================
+[ ] Build target indexer_connector sukses.
+[ ] Tidak ada crash/regresi pada alur insert/delete/deleted_by_query.
+[ ] Sync agent tetap berjalan normal.
+[ ] Proxmox graph menunjukkan perbaikan memory trend.
+[ ] htop/ps tetap sehat (tidak ada lonjakan abnormal baru).
+[ ] Log error indexer connector tidak meningkat setelah patch.
+
+========================================================================
+8) RENCANA LANJUTAN (JIKA TARGET UTAMA RSS INDEXER JAVA)
+========================================================================
+Jika objective utama adalah menurunkan memori proses Java wazuh-indexer secara
+langsung, maka langkah berikutnya:
+1. Clone repo wazuh-indexer.
+2. Profiling hotspot alokasi object pada jalur ingest/search.
+3. Lakukan patch di engine indexer, bukan hanya connector manager.
+
+========================================================================
+9) LOKASI DOKUMEN PENDAMPING
+========================================================================
+Dokumen penjelasan teknis detail perubahan kode:
+- PENJELASAN_RINCI_PERUBAHAN_KODE_INDEXER_CONNECTOR.txt

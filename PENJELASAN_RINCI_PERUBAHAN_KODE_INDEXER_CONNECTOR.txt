@@ -1,0 +1,166 @@
+PENJELASAN RINCI PERUBAHAN KODE - INDEXER CONNECTOR (WAZUH MANAGER)
+Tanggal: 2026-02-20
+Repository: /home/wazuh/wazuh-dev/Kerja-Praktek-Wazuh
+
+========================================================================
+1) TUJUAN PERUBAHAN
+========================================================================
+Perubahan ini ditujukan untuk optimasi penggunaan memori di sisi Wazuh Manager,
+khususnya pada modul shared "indexer_connector" saat sinkronisasi data ke
+Wazuh Indexer.
+
+Fokus utama:
+- Mengurangi alokasi objek JSON besar yang tidak perlu.
+- Mengurangi copy data string di jalur queue processing.
+- Menurunkan memory churn (alokasi/dealokasi cepat berulang).
+
+Catatan penting:
+- Ini bukan patch pada engine Java Wazuh Indexer/OpenSearch.
+- Jadi dampak terbesar ada di jalur manager -> indexer connector.
+
+========================================================================
+2) FILE YANG DIUBAH
+========================================================================
+A. src/shared_modules/indexer_connector/include/indexerConnector.hpp
+B. src/shared_modules/indexer_connector/src/indexerConnector.cpp
+
+Tidak ada file lain yang dimodifikasi.
+
+========================================================================
+3) RINCIAN PERUBAHAN PER FILE
+========================================================================
+
+-----------------------------------------------------------------------
+A) File: src/shared_modules/indexer_connector/include/indexerConnector.hpp
+-----------------------------------------------------------------------
+Perubahan:
+1. Menambahkan header:
+   - #include <unordered_set>
+
+2. Mengubah signature method:
+   - Sebelum:
+     void diff(const nlohmann::json& responseJson, ...)
+   - Sesudah:
+     void diff(const std::unordered_set<std::string>& remoteIds, ...)
+
+3. Mengubah return type method:
+   - Sebelum:
+     nlohmann::json getAgentDocumentsIds(...)
+   - Sesudah:
+     std::unordered_set<std::string> getAgentDocumentsIds(...)
+
+Alasan:
+- Supaya data hasil query indexer tidak perlu disimpan sebagai full JSON tree.
+- Cukup simpan ID dokumen yang memang dibutuhkan untuk proses diff.
+
+-----------------------------------------------------------------------
+B) File: src/shared_modules/indexer_connector/src/indexerConnector.cpp
+-----------------------------------------------------------------------
+
+1. Fungsi: getAgentDocumentsIds(...)
+   Lokasi utama: sekitar baris 270+
+
+   Perubahan inti:
+   - Sebelum:
+     Menyimpan response _search dan _scroll ke nlohmann::json besar (responseJson),
+     lalu menumpuk hits ke responseJson["hits"]["hits"].
+   - Sesudah:
+     Mengumpulkan hanya field _id ke std::unordered_set<std::string> remoteIds.
+
+   Detail teknis:
+   - Menambahkan variabel totalHits untuk kontrol loop scroll.
+   - Saat onSuccess:
+     parse response JSON -> ambil _scroll_id -> ambil hits -> emplace _id ke set.
+   - Loop scroll jalan selama remoteIds.size() < totalHits.
+   - Menambah guard agar stop jika tidak ada pertambahan data.
+   - Delete scroll ID hanya dilakukan jika scrollId tidak kosong.
+
+   Dampak:
+   - Menghindari penumpukan full JSON payload di memori.
+   - Mengurangi peak memory saat sinkronisasi agent besar.
+
+2. Fungsi: diff(...)
+   Lokasi utama: sekitar baris 506+
+
+   Perubahan inti:
+   - Sebelum:
+     Struktur "status" berupa vector<pair<id, bool>>, lalu pencarian nested loop
+     antara data local DB vs remote status.
+   - Sesudah:
+     Menggunakan unordered_set remoteIds -> disalin ke staleRemoteIds.
+     Saat iterasi DB lokal:
+       - jika key ada di staleRemoteIds -> erase (berarti exist di kedua sisi)
+       - jika tidak ada -> masuk actions sebagai INSERT
+     Sisa elemen staleRemoteIds -> masuk actions sebagai DELETE
+
+   Dampak:
+   - Kompleksitas lebih efisien dibanding nested loop lama.
+   - Overhead memori lebih rendah karena tidak menyimpan struktur status JSON->vector.
+
+3. Fungsi: sendBulkReactive(...)
+   Lokasi utama: sekitar baris 415+
+
+   Perubahan:
+   - Menambah reserve pada std::string bulkData:
+     bulkData.reserve(actions.size() * 96);
+
+   Dampak:
+   - Mengurangi reallocation berulang saat menyusun payload bulk.
+   - Menurunkan memory churn untuk batch besar.
+
+4. Queue processing lambda (constructor IndexerConnector)
+   Lokasi utama: sekitar baris 957+ dan 1307+
+
+   Perubahan:
+   - Sebelum:
+     auto data = dataQueue.front();
+   - Sesudah:
+     std::string data = std::move(dataQueue.front());
+
+   Dampak:
+   - Menghindari copy string payload dari queue.
+   - Mengurangi alokasi tambahan saat traffic event tinggi.
+
+========================================================================
+4) EFEK YANG DIHARAPKAN
+========================================================================
+- Peak memory saat proses sync/diff menurun.
+- Overhead transient memory (sementara) berkurang.
+- CPU pada tahap diff cenderung membaik untuk volume data besar.
+- Total memory pressure VM bisa turun meski RSS proses tertentu tidak turun drastis.
+
+========================================================================
+5) KENAPA DI PROXMOX BISA TURUN BESAR, TAPI HTOP KECIL?
+========================================================================
+Kemungkinan yang paling masuk akal:
+- Proxmox menampilkan total memory consumption level VM (termasuk reclaimable pages,
+  cache behavior, dan pressure memory total guest).
+- htop lebih menonjolkan RSS per proses pada saat snapshot.
+
+Karena patch ini banyak mengurangi alokasi sementara/churn:
+- Penurunan bisa besar di total pressure VM (terlihat jelas di Proxmox).
+- Tetapi pada RSS steady-state per proses, penurunannya bisa kecil.
+
+========================================================================
+6) STATUS VALIDASI BUILD
+========================================================================
+Target yang dibangun:
+- indexer_connector
+
+Perintah build yang dijalankan:
+- cmake -S src -B src/build -DCMAKE_BUILD_TYPE=Release
+- cmake --build src/build --target indexer_connector -j2
+
+Hasil:
+- Build sukses (target indexer_connector ter-link dengan baik).
+
+========================================================================
+7) BATASAN SCOPE
+========================================================================
+Patch ini TIDAK memodifikasi:
+- kode Java Wazuh Indexer/OpenSearch
+- konfigurasi JVM runtime
+- parameter kernel/OS
+
+Jika target utama adalah menurunkan RSS proses Java indexer secara signifikan,
+maka tetap perlu track terpisah: clone dan patch pada repo wazuh-indexer.
