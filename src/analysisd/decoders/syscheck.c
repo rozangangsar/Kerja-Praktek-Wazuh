@@ -100,6 +100,7 @@ static int fim_fetch_attributes_state(cJSON *attr, Eventinfo *lf, char new_state
 
 // Replace the coded fields with the decoded ones in the checksum
 static void fim_adjust_checksum(sk_sum_t *newsum, char **checksum);
+static int fim_escape_spaces_for_wdb(const char *input, char *output, size_t output_size);
 
 /**
  * @brief Decode a cJSON with Windows permissions and convert to old format string
@@ -376,6 +377,7 @@ int fim_db_search(char *f_name, char *c_sum, char *w_sum, Eventinfo *lf, _sdb *s
     char response[OS_SIZE_6144] = {0};
     char *check_sum = NULL;
     char *sym_path = NULL;
+    char escaped_checksum[(OS_SIZE_6144 * 2) + 1] = {0};
     sk_sum_t oldsum = { .size = NULL };
     sk_sum_t newsum = { .size = NULL };
     time_t *end_first_scan = NULL;
@@ -491,20 +493,21 @@ int fim_db_search(char *f_name, char *c_sum, char *w_sum, Eventinfo *lf, _sdb *s
                 sym_path = escape_syscheck_field(newsum.symbolic_path);
             }
 
-            // We need to escape the checksum because it will have
-            // spaces if the event comes from Windows
-            char *checksum_esc = wstr_replace(new_check_sum, " ", "\\ ");
+            // Escape spaces in checksum without heap allocations per event.
+            if (fim_escape_spaces_for_wdb(new_check_sum, escaped_checksum, sizeof(escaped_checksum)) != 0) {
+                merror("FIM decoder: Cannot escape checksum.");
+                goto exit_fail;
+            }
             snprintf(wazuhdb_query, OS_SIZE_6144, "agent %s syscheck save %s %s!%d:%ld:%s %s",
                     lf->agent_id,
                     *ttype,
-                    checksum_esc,
+                    escaped_checksum,
                     changes,
                     lf->time.tv_sec,
                     sym_path ? sym_path : "",
                     f_name
             );
             os_free(sym_path);
-            os_free(checksum_esc);
             db_result = wdbc_query_ex(&sdb->socket, wazuhdb_query, response, OS_SIZE_6144);
 
             switch (db_result) {
@@ -1479,10 +1482,8 @@ void fim_send_db_delete(_sdb * sdb, const char * agent_id, const char * path) {
 }
 
 void fim_send_db_query(int * sock, const char * query) {
-    char * response;
+    char response[OS_MAXSTR] = {0};
     char * arg;
-
-    os_malloc(OS_MAXSTR, response);
 
     switch (wdbc_query_ex(sock, query, response, OS_MAXSTR)) {
     case -2:
@@ -1506,7 +1507,7 @@ void fim_send_db_query(int * sock, const char * query) {
     }
 
 end:
-    free(response);
+    return;
 }
 
 
@@ -1935,4 +1936,31 @@ void fim_adjust_checksum(sk_sum_t *newsum, char **checksum) {
         wm_strcat(checksum, second_part, 0);
         free(second_part);
     }
+}
+
+static int fim_escape_spaces_for_wdb(const char *input, char *output, size_t output_size) {
+    size_t in = 0;
+    size_t out = 0;
+
+    if (!input || !output || output_size == 0) {
+        return -1;
+    }
+
+    for (; input[in] != '\0'; ++in) {
+        if (input[in] == ' ') {
+            if (out + 2 >= output_size) {
+                return -1;
+            }
+            output[out++] = '\\';
+            output[out++] = ' ';
+        } else {
+            if (out + 1 >= output_size) {
+                return -1;
+            }
+            output[out++] = input[in];
+        }
+    }
+
+    output[out] = '\0';
+    return 0;
 }

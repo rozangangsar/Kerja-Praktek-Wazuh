@@ -1,0 +1,178 @@
+DOKUMENTASI LANGKAH-LANGKAH OPTIMASI ANALYSISD (WAZUH MANAGER)
+================================================================
+
+Tujuan dokumen
+--------------
+Dokumen ini menjelaskan langkah teknis dari awal sampai optimasi kode analysisd berjalan,
+termasuk build, deploy, pengukuran before/after, validasi, dan rollback.
+
+Ruang lingkup
+-------------
+- Komponen: Wazuh Manager backend
+- Proses target: wazuh-analysisd
+- File optimasi: src/analysisd/decoders/syscheck.c
+- Fungsi: fim_db_search()
+
+Konsep optimasi yang diterapkan
+-------------------------------
+Sebelum optimasi:
+- Buffer query dan response dialokasikan per-event menggunakan heap (os_calloc)
+- Buffer dibebaskan per-event (os_free)
+
+Sesudah optimasi:
+- Buffer query/response dipindahkan ke stack local buffer
+- Mengurangi alokasi/free berulang di jalur event FIM
+
+Dampak yang diharapkan:
+- Menurunkan allocator churn
+- Mengurangi fragmentasi heap jangka panjang
+- Menstabilkan jejak memori process analysisd pada beban tinggi
+
+
+Prasyarat
+---------
+1) Source code tersedia di:
+   ~/wazuh-dev/Kerja-Praktek-Wazuh
+
+2) Dependensi build tersedia (contoh Ubuntu):
+   sudo apt update
+   sudo apt install -y cmake build-essential gcc g++ make automake autoconf libtool curl python3 policycoreutils pkg-config
+
+3) Service aktif:
+   - wazuh-manager aktif untuk runtime test
+   - atau environment test terpisah jika tidak ingin menyentuh service produksi
+
+
+A. Baseline (Sebelum Optimasi)
+------------------------------
+1) Pastikan source pada kondisi baseline (belum patch optimasi):
+   cd ~/wazuh-dev/Kerja-Praktek-Wazuh
+   git checkout -- src/analysisd/decoders/syscheck.c
+
+2) Build baseline:
+   cd ~/wazuh-dev/Kerja-Praktek-Wazuh/src
+   make TARGET=server -j"$(nproc)"
+
+3) Deploy binary baseline ke service:
+   sudo systemctl stop wazuh-manager
+   sudo cp /var/ossec/bin/wazuh-analysisd /var/ossec/bin/wazuh-analysisd.service.bak
+   sudo cp ~/wazuh-dev/Kerja-Praktek-Wazuh/src/wazuh-analysisd /var/ossec/bin/wazuh-analysisd
+   sudo chown root:wazuh /var/ossec/bin/wazuh-analysisd
+   sudo chmod 750 /var/ossec/bin/wazuh-analysisd
+   sudo systemctl start wazuh-manager
+
+4) Verifikasi service baseline:
+   sudo systemctl status wazuh-manager --no-pager
+   sudo tail -n 100 /var/ossec/logs/ossec.log
+
+5) Ambil metrik baseline RSS (before):
+   cd ~/wazuh-dev/Kerja-Praktek-Wazuh
+   ./tools/testing/memory_rss_benchmark.sh wazuh-analysisd 120 1 /tmp/rss-before.csv
+
+
+B. Terapkan Optimasi Kode
+-------------------------
+Perubahan pada fungsi fim_db_search() di file:
+- src/analysisd/decoders/syscheck.c
+
+Perubahan inti yang harus ada:
+1) Dari:
+   char *wazuhdb_query = NULL;
+   char *response = NULL;
+   os_calloc(..., wazuhdb_query);
+   os_calloc(..., response);
+   os_free(wazuhdb_query);
+   os_free(response);
+
+2) Menjadi:
+   char wazuhdb_query[OS_SIZE_6144 + 1] = {0};
+   char response[OS_SIZE_6144] = {0};
+   (hapus alokasi/free heap untuk dua buffer ini)
+
+Catatan:
+- Logic bisnis tidak diubah.
+- Hanya strategi manajemen memori buffer lokal yang diubah.
+
+
+C. Build dan Deploy Versi Optimasi
+----------------------------------
+1) Build source setelah patch:
+   cd ~/wazuh-dev/Kerja-Praktek-Wazuh/src
+   make TARGET=server -j"$(nproc)"
+
+2) Deploy binary optimized ke service:
+   sudo systemctl stop wazuh-manager
+   sudo cp ~/wazuh-dev/Kerja-Praktek-Wazuh/src/wazuh-analysisd /var/ossec/bin/wazuh-analysisd
+   sudo chown root:wazuh /var/ossec/bin/wazuh-analysisd
+   sudo chmod 750 /var/ossec/bin/wazuh-analysisd
+   sudo systemctl start wazuh-manager
+
+3) Verifikasi service optimized:
+   sudo systemctl status wazuh-manager --no-pager
+   sudo tail -n 100 /var/ossec/logs/ossec.log
+
+
+D. Pengukuran Sesudah Optimasi (After)
+--------------------------------------
+1) Ambil metrik RSS sesudah:
+   cd ~/wazuh-dev/Kerja-Praktek-Wazuh
+   ./tools/testing/memory_rss_benchmark.sh wazuh-analysisd 120 1 /tmp/rss-after.csv
+
+2) Bandingkan before vs after:
+   ./tools/testing/compare_rss_benchmark.sh /tmp/rss-before.csv /tmp/rss-after.csv
+
+3) Interpretasi hasil:
+- Delta Average < 0: konsumsi RAM rata-rata menurun (improved)
+- Delta Average > 0: konsumsi RAM naik (regressed)
+- Delta sekitar 0: dampak belum signifikan / perlu workload lebih representatif
+
+
+E. Validasi Tambahan yang Direkomendasikan
+------------------------------------------
+1) Cek kesehatan service:
+   sudo systemctl status wazuh-manager --no-pager
+
+2) Cek error runtime:
+   sudo tail -n 200 /var/ossec/logs/ossec.log
+
+3) Cek proses terkait untuk konteks total RAM:
+   ps -eo comm,rss --sort=-rss | awk '/^wazuh-/{sum+=$2; printf "%-20s %8.2f MB\n",$1,$2/1024} END{printf "\nTOTAL WAZUH RSS: %.2f MB\n",sum/1024}'
+
+Catatan penting:
+- Script benchmark mengukur 1 proses (wazuh-analysisd), bukan total seluruh stack Wazuh.
+
+
+F. Rollback Cepat Jika Terjadi Masalah
+--------------------------------------
+1) Restore binary service original:
+   sudo systemctl stop wazuh-manager
+   sudo cp /var/ossec/bin/wazuh-analysisd.service.bak /var/ossec/bin/wazuh-analysisd
+   sudo chown root:wazuh /var/ossec/bin/wazuh-analysisd
+   sudo chmod 750 /var/ossec/bin/wazuh-analysisd
+   sudo systemctl start wazuh-manager
+
+2) Verifikasi rollback:
+   sudo systemctl status wazuh-manager --no-pager
+   sudo tail -n 100 /var/ossec/logs/ossec.log
+
+
+G. Manajemen Git agar Mudah Ulang-Uji
+-------------------------------------
+1) Simpan versi optimasi di branch sendiri:
+   cd ~/wazuh-dev/Kerja-Praktek-Wazuh
+   git checkout -b feat/analysisd-rss-opt
+   git add src/analysisd/decoders/syscheck.c tools/testing/memory_rss_benchmark.sh tools/testing/compare_rss_benchmark.sh
+   git commit -m "Optimize FIM decoder allocations and add RSS benchmark scripts"
+
+2) Pindah baseline/optimasi dengan mudah:
+- Baseline:
+  git checkout main
+- Optimasi:
+  git checkout feat/analysisd-rss-opt
+
+
+H. Kesimpulan Teknis
+--------------------
+Optimasi dilakukan pada hot path analysisd dengan memindahkan buffer temporer dari heap ke stack.
+Pendekatan ini mempertahankan behavior fungsional namun mengurangi overhead alokasi per-event,
+dan menyediakan metode pengukuran terstandar (before/after) agar hasil dapat dipertanggungjawabkan.

@@ -1,0 +1,76 @@
+RINGKASAN 1 HALAMAN - OPTIMASI RAM BACKEND WAZUH MANAGER
+=========================================================
+
+Judul:
+- Optimasi penggunaan RAM pada backend Wazuh Manager (analysisd - FIM decoder)
+
+Tujuan:
+- Mengurangi overhead alokasi memori berulang pada jalur pemrosesan event FIM.
+- Menjaga behavior fungsional tetap sama.
+
+Latar belakang singkat:
+- Pada jalur FIM di analysisd, terdapat pola alokasi/free buffer query-response ke wazuh-db yang dilakukan berulang per event.
+- Pada beban event tinggi, pola ini berpotensi meningkatkan allocator churn dan fragmentasi heap.
+
+Perubahan teknis utama:
+- File: src/analysisd/decoders/syscheck.c
+- Fungsi: fim_db_search()
+
+Sebelum:
+- query buffer: heap allocation per event (os_calloc) + os_free
+- response buffer: heap allocation per event (os_calloc) + os_free
+
+Sesudah:
+- query buffer dipindah ke stack lokal:
+  char wazuhdb_query[OS_SIZE_6144 + 1] = {0};
+- response buffer dipindah ke stack lokal:
+  char response[OS_SIZE_6144] = {0};
+- os_free untuk dua buffer tersebut dihapus
+
+Alasan desain:
+- Mengurangi alokasi/free dinamis di hot path event processing.
+- Menurunkan pressure allocator dan potensi fragmentasi heap jangka panjang.
+- Perubahan kecil, terlokalisasi, dan mudah rollback.
+
+Status implementasi:
+- Patch sudah diterapkan kembali.
+- Build sukses:
+  make TARGET=server -j"$(nproc)"
+  (output akhir: Done building server)
+
+Tool ukur yang ditambahkan:
+1) tools/testing/memory_rss_benchmark.sh
+   - Sampling RSS proses (default wazuh-analysisd)
+   - Output CSV + ringkasan avg/max
+
+2) tools/testing/compare_rss_benchmark.sh
+   - Membandingkan before vs after
+   - Output delta MB dan delta % (avg/max/min)
+
+Baseline yang sudah terekam:
+- Samples: 120
+- Avg RSS: 32.72 MB
+- Max RSS: 44.41 MB
+
+Langkah validasi akhir:
+1. Deploy binary hasil optimasi ke /var/ossec/bin/wazuh-analysisd
+2. Ambil data after:
+   ./tools/testing/memory_rss_benchmark.sh wazuh-analysisd 120 1 /tmp/rss-after.csv
+3. Compare:
+   ./tools/testing/compare_rss_benchmark.sh /tmp/rss-before.csv /tmp/rss-after.csv
+
+Risiko dan mitigasi:
+- Risiko: stack frame fungsi sedikit lebih besar.
+- Mitigasi: ukuran buffer masih aman, scope patch sempit, dan rollback cepat tersedia.
+
+Rollback cepat:
+- Restore binary backup service dan restart wazuh-manager.
+- Atau checkout source baseline + rebuild.
+
+Catatan penting presentasi:
+- Optimasi ini fokus pada backend manager (analysisd), bukan tuning indexer JVM.
+- Konsumsi RAM total sistem bisa tetap tinggi jika indexer mendominasi; itu track optimasi terpisah.
+
+Kesimpulan:
+- Patch code-level ini adalah optimasi nyata, terukur, dan dapat dipertanggungjawabkan untuk proyek.
+- Nilai utama: mengurangi memory-allocation overhead di jalur event yang sering dieksekusi.

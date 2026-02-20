@@ -1,0 +1,224 @@
+LAPORAN OPTIMASI RAM WAZUH MANAGER (PERSIAPAN PRESENTASI)
+==========================================================
+
+Nama proyek:
+- Optimasi penggunaan RAM pada backend Wazuh Manager (fokus komponen analysisd/FIM decoder)
+
+Tanggal:
+- 2026-02-20
+
+Ringkasan Eksekutif
+-------------------
+Saya melakukan optimasi di level kode backend Wazuh Manager pada jalur pemrosesan event FIM (File Integrity Monitoring), tepatnya di fungsi:
+- src/analysisd/decoders/syscheck.c -> fim_db_search()
+
+Tujuan optimasi:
+- Mengurangi overhead alokasi memori berulang per event.
+- Menurunkan pressure allocator/fragmentasi heap.
+- Menjaga perilaku fungsional tetap sama.
+
+Status saat ini:
+- Patch optimasi sudah diterapkan.
+- Build backend sukses.
+- Tool benchmark before/after sudah dibuat.
+- Baseline memory sudah diambil; pengukuran after siap dijalankan.
+
+
+1) Latar Belakang Masalah
+-------------------------
+Pada beban event tinggi, komponen analysisd memproses banyak event secara cepat. Di jalur FIM, terdapat alokasi/free buffer query-response ke wazuh-db yang terjadi berulang per event. Pola ini dapat menyebabkan:
+- churn allocator tinggi,
+- fragmentasi heap,
+- konsumsi RAM kurang stabil saat throughput naik.
+
+Catatan penting dari observasi sistem:
+- Konsumsi RAM terbesar sistem ternyata berasal dari wazuh-indexer (JVM), bukan hanya wazuh-analysisd.
+- Namun, untuk scope proyek backend manager, optimasi dilakukan pada proses analysisd sesuai target kode.
+
+
+2) Scope dan Batasan
+--------------------
+Scope yang dikerjakan:
+- Kode backend manager di repo: Kerja-Praktek-Wazuh (fork dari wazuh/wazuh)
+- Fokus file: src/analysisd/decoders/syscheck.c
+
+Di luar scope patch ini:
+- Tuning JVM indexer (heap/direct memory) tidak dimasukkan ke patch kode manager.
+- Perubahan arsitektural besar/modul lain tidak disentuh.
+
+
+3) Perubahan Teknis yang Dilakukan
+----------------------------------
+File yang diubah:
+- src/analysisd/decoders/syscheck.c
+
+Fungsi yang diubah:
+- fim_db_search(char *f_name, char *c_sum, char *w_sum, Eventinfo *lf, _sdb *sdb)
+
+Perubahan inti:
+A. Sebelum optimasi
+- query buffer: dialokasikan dinamis per event (os_calloc)
+- response buffer: dialokasikan dinamis per event (os_calloc)
+- di cleanup: keduanya di-os_free
+
+B. Sesudah optimasi
+- query buffer dipindah ke stack:
+  char wazuhdb_query[OS_SIZE_6144 + 1] = {0};
+- response buffer dipindah ke stack:
+  char response[OS_SIZE_6144] = {0};
+- cleanup os_free untuk 2 buffer tersebut dihapus (karena bukan heap allocation)
+
+Alasan teknis perubahan:
+- Menghindari alokasi/free berulang yang tidak perlu.
+- Menurunkan overhead allocator per event.
+- Mengurangi potensi fragmentasi heap pada proses long-running.
+
+Efek fungsional yang diharapkan:
+- Tidak mengubah hasil parsing/event logic.
+- Hanya mengubah strategi manajemen memori buffer lokal.
+
+
+4) Validasi Build
+-----------------
+Command build:
+- cd ~/wazuh-dev/Kerja-Praktek-Wazuh/src
+- make TARGET=server -j"$(nproc)"
+
+Hasil:
+- Sukses dengan output akhir: "Done building server"
+
+
+5) Tool Benchmark yang Ditambahkan
+----------------------------------
+A. Script sampling RSS:
+- tools/testing/memory_rss_benchmark.sh
+
+Fungsi:
+- Sampling RSS proses (default: wazuh-analysisd)
+- Menyimpan hasil CSV format: epoch,pid,rss_kb
+- Menampilkan ringkasan Samples/Avg RSS/Max RSS
+
+Contoh pakai:
+- ./tools/testing/memory_rss_benchmark.sh wazuh-analysisd 120 1 /tmp/rss-before.csv
+
+B. Script perbandingan before/after:
+- tools/testing/compare_rss_benchmark.sh
+
+Fungsi:
+- Membandingkan 2 CSV hasil sampling
+- Menampilkan Average/Maximum/Minimum RSS (MB)
+- Menampilkan Delta dan Delta(%)
+- Menyimpulkan improved/regressed/unchanged
+
+Contoh pakai:
+- ./tools/testing/compare_rss_benchmark.sh /tmp/rss-before.csv /tmp/rss-after.csv
+
+
+6) Hasil Pengukuran Saat Ini
+----------------------------
+Baseline (sebelum) yang sudah terekam:
+- Command:
+  ./tools/testing/memory_rss_benchmark.sh wazuh-analysisd 120 1 /tmp/rss-before.csv
+- Ringkasan:
+  Samples: 120
+  Avg RSS: 32.72 MB
+  Max RSS: 44.41 MB
+
+Kondisi sesudah optimasi:
+- Patch sudah aktif dan build sudah sukses.
+- Tinggal ambil /tmp/rss-after.csv lalu bandingkan otomatis.
+
+Command final after:
+- ./tools/testing/memory_rss_benchmark.sh wazuh-analysisd 120 1 /tmp/rss-after.csv
+- ./tools/testing/compare_rss_benchmark.sh /tmp/rss-before.csv /tmp/rss-after.csv
+
+
+7) Cara Deploy Binary Hasil Build ke Service Terpasang
+------------------------------------------------------
+Catatan: ini dipakai jika runtime menggunakan service /var/ossec.
+
+Deploy binary optimized:
+1. sudo systemctl stop wazuh-manager
+2. sudo cp ~/wazuh-dev/Kerja-Praktek-Wazuh/src/wazuh-analysisd /var/ossec/bin/wazuh-analysisd
+3. sudo chown root:wazuh /var/ossec/bin/wazuh-analysisd
+4. sudo chmod 750 /var/ossec/bin/wazuh-analysisd
+5. sudo systemctl start wazuh-manager
+
+Verifikasi:
+- sudo systemctl status wazuh-manager --no-pager
+- sudo tail -n 100 /var/ossec/logs/ossec.log
+
+
+8) Risiko, Trade-off, dan Mitigasi
+----------------------------------
+Risiko teknis patch:
+- Buffer stack bertambah (~12 KB total untuk dua buffer), namun masih aman untuk ukuran stack thread normal.
+
+Trade-off:
+- Mengurangi heap churn, tetapi ukuran stack frame fungsi sedikit naik.
+
+Mitigasi:
+- Patch dibatasi pada satu fungsi.
+- Build berhasil.
+- Bisa rollback cepat via restore binary backup atau checkout git.
+
+
+9) Rollback Plan
+----------------
+A. Rollback service binary:
+- sudo systemctl stop wazuh-manager
+- sudo cp /var/ossec/bin/wazuh-analysisd.service.bak /var/ossec/bin/wazuh-analysisd
+- sudo chown root:wazuh /var/ossec/bin/wazuh-analysisd
+- sudo chmod 750 /var/ossec/bin/wazuh-analysisd
+- sudo systemctl start wazuh-manager
+
+B. Rollback source code:
+- git checkout -- src/analysisd/decoders/syscheck.c
+- rebuild
+
+
+10) Catatan Penting untuk Sesi Tanya Jawab
+------------------------------------------
+Q: Kenapa angka RSS analysisd kecil (30-40 MB), tapi htop total besar (hingga GB)?
+A: RSS script mengukur satu proses (wazuh-analysisd). htop total mencakup proses lain (wazuh-db, modulesd, remoted, terutama wazuh-indexer/Java).
+
+Q: Kenapa bukan indexer yang dioptimasi dulu?
+A: Scope proyek ini backend manager code-level optimization. Tuning indexer JVM adalah track terpisah (ops tuning runtime).
+
+Q: Kenapa perubahan ini valid sebagai optimasi?
+A: Karena mengurangi alokasi/free heap berulang di hot path event processing tanpa mengubah business logic.
+
+
+11) Poin Presentasi (Versi 3-5 Menit)
+-------------------------------------
+1. Identifikasi masalah: jalur FIM di analysisd melakukan alokasi heap berulang per event.
+2. Intervensi: pindahkan buffer query/response ke stack local buffer.
+3. Dampak teknis: kurangi allocator churn dan fragmentasi, behavior fungsional tetap.
+4. Validasi: build sukses + tool benchmark before/after.
+5. Hasil awal: baseline tercatat; pipeline pengukuran after siap dan repeatable.
+6. Nilai engineering: patch kecil, terukur, bisa rollback cepat.
+
+
+12) Lampiran Command Cepat
+--------------------------
+Build:
+- cd ~/wazuh-dev/Kerja-Praktek-Wazuh/src
+- make TARGET=server -j"$(nproc)"
+
+Deploy:
+- sudo systemctl stop wazuh-manager
+- sudo cp ~/wazuh-dev/Kerja-Praktek-Wazuh/src/wazuh-analysisd /var/ossec/bin/wazuh-analysisd
+- sudo chown root:wazuh /var/ossec/bin/wazuh-analysisd
+- sudo chmod 750 /var/ossec/bin/wazuh-analysisd
+- sudo systemctl start wazuh-manager
+
+Benchmark:
+- cd ~/wazuh-dev/Kerja-Praktek-Wazuh
+- ./tools/testing/memory_rss_benchmark.sh wazuh-analysisd 120 1 /tmp/rss-before.csv
+- ./tools/testing/memory_rss_benchmark.sh wazuh-analysisd 120 1 /tmp/rss-after.csv
+- ./tools/testing/compare_rss_benchmark.sh /tmp/rss-before.csv /tmp/rss-after.csv
+
+
+Penutup
+-------
+Optimasi ini memberikan fondasi yang kuat untuk pembuktian kuantitatif RAM usage di backend manager, dengan perubahan kode yang kecil, terkontrol, dan aman untuk dipresentasikan sebagai kontribusi engineering yang nyata.
