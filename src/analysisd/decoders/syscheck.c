@@ -370,10 +370,10 @@ int fim_db_search(char *f_name, char *c_sum, char *w_sum, Eventinfo *lf, _sdb *s
     int changes = 0;
     int i = 0;
     char *ttype[OS_SIZE_128];
-    char *wazuhdb_query = NULL;
+    char wazuhdb_query[OS_SIZE_6144 + 1] = {0};
     char *new_check_sum = NULL;
     char *old_check_sum = NULL;
-    char *response = NULL;
+    char response[OS_SIZE_6144] = {0};
     char *check_sum = NULL;
     char *sym_path = NULL;
     sk_sum_t oldsum = { .size = NULL };
@@ -385,12 +385,10 @@ int fim_db_search(char *f_name, char *c_sum, char *w_sum, Eventinfo *lf, _sdb *s
     memset(&oldsum, 0, sizeof(sk_sum_t));
     memset(&newsum, 0, sizeof(sk_sum_t));
 
-    os_calloc(OS_SIZE_6144 + 1, sizeof(char), wazuhdb_query);
     os_strdup(c_sum, new_check_sum);
 
     snprintf(wazuhdb_query, OS_SIZE_6144, "agent %s syscheck load %s", lf->agent_id, f_name);
 
-    os_calloc(OS_SIZE_6144, sizeof(char), response);
     db_result = wdbc_query_ex(&sdb->socket, wazuhdb_query, response, OS_SIZE_6144);
 
     // Fail trying load info from DDBB
@@ -571,10 +569,8 @@ int fim_db_search(char *f_name, char *c_sum, char *w_sum, Eventinfo *lf, _sdb *s
         }
         sk_sum_clean(&newsum);
         sk_sum_clean(&oldsum);
-        os_free(response);
         os_free(new_check_sum);
         os_free(old_check_sum);
-        os_free(wazuhdb_query);
 
         return (1);
     } else {
@@ -584,19 +580,15 @@ int fim_db_search(char *f_name, char *c_sum, char *w_sum, Eventinfo *lf, _sdb *s
 exit_ok:
     sk_sum_clean(&newsum);
     sk_sum_clean(&oldsum);
-    os_free(response);
     os_free(new_check_sum);
     os_free(old_check_sum);
-    os_free(wazuhdb_query);
     return (0);
 
 exit_fail:
     sk_sum_clean(&newsum);
     sk_sum_clean(&oldsum);
-    os_free(response);
     os_free(new_check_sum);
     os_free(old_check_sum);
-    os_free(wazuhdb_query);
     return (-1);
 }
 
