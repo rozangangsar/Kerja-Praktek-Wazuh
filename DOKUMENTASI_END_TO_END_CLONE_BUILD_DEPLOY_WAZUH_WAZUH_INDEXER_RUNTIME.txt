@@ -1,0 +1,203 @@
+DOKUMENTASI END-TO-END
+Clone, Build, Deploy, dan Verifikasi Runtime
+Kerja-Praktek-Wazuh + wazuh-indexer
+
+Tanggal: 2026-02-24
+Lingkungan contoh: Ubuntu, single-node Wazuh Indexer, RAM 4.8 GB
+
+=====================================================================
+1) TUJUAN
+=====================================================================
+Dokumen ini menjelaskan langkah lengkap agar orang lain bisa mengikuti:
+- Clone repo backend Wazuh (Kerja-Praktek-Wazuh)
+- Clone repo wazuh-indexer
+- Build optimasi backend dan indexer
+- Deploy ke runtime
+- Verifikasi hasil
+- Rollback jika gagal
+
+=====================================================================
+2) PRASYARAT
+=====================================================================
+Pastikan paket berikut tersedia:
+- git
+- build-essential / toolchain sesuai kebutuhan build Wazuh
+- openjdk-21-jdk
+- jq (dibutuhkan saat build package deb tertentu)
+
+Cek cepat:
+- java -version
+- git --version
+- jq --version
+
+Struktur direktori yang direkomendasikan:
+- ~/wazuh-dev/Kerja-Praktek-Wazuh
+- ~/wazuh-dev/wazuh-indexer
+
+=====================================================================
+3) CLONE REPO
+=====================================================================
+3.1 Clone backend Wazuh
+- cd ~/wazuh-dev
+- git clone <repo-fork-anda>/Kerja-Praktek-Wazuh.git
+
+3.2 Clone wazuh-indexer
+- cd ~/wazuh-dev
+- git clone <repo-fork-anda>/wazuh-indexer.git
+
+=====================================================================
+4) BUILD & DEPLOY BACKEND (Kerja-Praktek-Wazuh)
+=====================================================================
+Catatan: fokus perubahan backend ada di indexer_connector dan analysisd path.
+
+4.1 Build backend sesuai workflow repo (yang dipakai saat implementasi)
+Contoh artifact penting:
+- src/build/shared_modules/indexer_connector/libindexer_connector.so
+
+4.2 Deploy library connector ke runtime
+- sudo cp src/build/shared_modules/indexer_connector/libindexer_connector.so /var/ossec/lib/libindexer_connector.so
+- sudo chown root:wazuh /var/ossec/lib/libindexer_connector.so
+- sudo chmod 0750 /var/ossec/lib/libindexer_connector.so
+- sudo systemctl restart wazuh-manager
+
+4.3 Verifikasi backend optimasi benar-benar terpasang
+- sha256sum /var/ossec/lib/libindexer_connector.so
+- sha256sum src/build/shared_modules/indexer_connector/libindexer_connector.so
+
+Hasil valid jika hash sama.
+
+=====================================================================
+5) BUILD CODE-LEVEL WAZUH INDEXER (BRANCH KOMPATIBEL)
+=====================================================================
+Penting:
+- Gunakan branch kompatibel OpenSearch runtime 2.19.4.
+- Branch yang dipakai: feat/indexer-memory-opt-2.19.4
+
+5.1 Checkout branch optimasi
+- cd ~/wazuh-dev/wazuh-indexer
+- git checkout feat/indexer-memory-opt-2.19.4
+
+5.2 Jalankan unit test policy optimasi
+- ./gradlew :server:test --tests org.opensearch.index.shard.AdaptiveUsageTrackingQueryCachingPolicyTests --no-daemon
+
+5.3 Build jar server
+- ./gradlew :server:jar --no-daemon
+
+Artifact contoh:
+- server/build/distributions/opensearch-2.19.4-SNAPSHOT.jar
+
+=====================================================================
+6) DEPLOY WAZUH INDEXER KE RUNTIME (PRAKTIK AMAN)
+=====================================================================
+KRITIS:
+- Jangan install paket "wazuh-indexer-min" untuk node produksi yang butuh plugin/security lengkap.
+- Hindari mix versi library.
+- Hindari meninggalkan dua core jar sekaligus (jar hell).
+
+6.1 Backup runtime jar sebelum replace
+- sudo cp /usr/share/wazuh-indexer/lib/opensearch-2.19.4.jar /usr/share/wazuh-indexer/lib/opensearch-2.19.4.jar.bak-$(date +%Y%m%d-%H%M%S)
+
+6.2 Replace jar target
+- sudo cp ~/wazuh-dev/wazuh-indexer/server/build/distributions/opensearch-2.19.4-SNAPSHOT.jar /usr/share/wazuh-indexer/lib/opensearch-2.19.4.jar
+- sudo chown root:wazuh /usr/share/wazuh-indexer/lib/opensearch-2.19.4.jar
+- sudo chmod 0644 /usr/share/wazuh-indexer/lib/opensearch-2.19.4.jar
+
+6.3 Pastikan tidak ada jar snapshot tambahan di lib
+- sudo rm -f /usr/share/wazuh-indexer/lib/opensearch-2.19.4-SNAPSHOT.jar
+
+6.4 Restart service
+- sudo systemctl daemon-reload
+- sudo systemctl restart wazuh-indexer
+
+6.5 Verifikasi service
+- sudo systemctl is-active wazuh-indexer
+- sudo journalctl -u wazuh-indexer -n 80 --no-pager
+
+Jika muncul "jar hell" atau NoClassDefFoundError, rollback (lihat bagian 9).
+
+=====================================================================
+7) TUNING RUNTIME JVM UNTUK TURUNKAN RAM BASELINE
+=====================================================================
+Nilai yang dipakai saat optimasi RAM runtime:
+- Xms 768m
+- Xmx 768m
+- MaxDirectMemorySize 256m
+- AlwaysPreTouch OFF (efektif via -XX:-AlwaysPreTouch)
+
+7.1 Set parameter
+- sudo sed -i 's/^-Xms.*/-Xms768m/' /etc/wazuh-indexer/jvm.options
+- sudo sed -i 's/^-Xmx.*/-Xmx768m/' /etc/wazuh-indexer/jvm.options
+- sudo sed -i 's/^-XX:MaxDirectMemorySize=.*/-XX:MaxDirectMemorySize=256m/' /etc/wazuh-indexer/jvm.options
+- sudo sed -i '/^-XX:+AlwaysPreTouch/d' /etc/wazuh-indexer/jvm.options
+- sudo grep -q '^-XX:-AlwaysPreTouch$' /etc/wazuh-indexer/jvm.options || echo '-XX:-AlwaysPreTouch' | sudo tee -a /etc/wazuh-indexer/jvm.options
+
+7.2 Restart + cek argumen runtime
+- sudo systemctl restart wazuh-indexer
+- pgrep -fa '/usr/share/wazuh-indexer/jdk/bin/java' | head -n1
+
+Catatan:
+- Jika argumen masih menampilkan +AlwaysPreTouch dan -AlwaysPreTouch sekaligus,
+  flag terakhir yang menang. Jika -AlwaysPreTouch di akhir, status efektifnya OFF.
+
+=====================================================================
+8) VERIFIKASI HEALTH DAN CACHE
+=====================================================================
+8.1 Cek cluster
+- sudo curl --insecure --cert /etc/wazuh-indexer/certs/admin.pem --key /etc/wazuh-indexer/certs/admin-key.pem "https://127.0.0.1:9200/_cluster/health?pretty"
+
+8.2 Cek stats cache internal indexer
+- sudo curl --insecure --cert /etc/wazuh-indexer/certs/admin.pem --key /etc/wazuh-indexer/certs/admin-key.pem "https://127.0.0.1:9200/_nodes/stats/jvm,indices/query_cache,request_cache,fielddata?pretty"
+
+8.3 Cek RAM proses
+- ps -eo pid,ppid,cmd,%mem,%cpu,rss,vsz --sort=-rss | head -n 20
+- free -h
+
+Interpretasi penting:
+- Query cache/request cache/fielddata kecil => cache internal indexer bukan biang utama RAM tinggi.
+- Buff/cache Linux bisa besar dan normal (reclaimable), beda dengan RAM proses Java.
+
+=====================================================================
+9) TROUBLESHOOTING YANG TERJADI SAAT IMPLEMENTASI
+=====================================================================
+9.1 Error: unknown setting plugins.security... saat start
+Penyebab:
+- Pakai paket wazuh-indexer-min (plugin/security tidak lengkap).
+Solusi:
+- Kembali ke paket full yang kompatibel.
+
+9.2 Error: jar hell
+Penyebab:
+- Ada dua jar core sekaligus (mis. opensearch-2.19.4.jar + opensearch-2.19.4-SNAPSHOT.jar).
+Solusi:
+- Hapus jar tambahan snapshot dari /usr/share/wazuh-indexer/lib.
+
+9.3 Error: flood-stage watermark / read_only_allow_delete
+Penyebab:
+- Disk hampir penuh.
+Solusi:
+- Bersihkan disk sampai aman (<90% disarankan).
+- Unblock index:
+  sudo curl --insecure --cert /etc/wazuh-indexer/certs/admin.pem --key /etc/wazuh-indexer/certs/admin-key.pem \
+  -H 'Content-Type: application/json' -X PUT "https://127.0.0.1:9200/_all/_settings" \
+  -d '{"index.blocks.read_only_allow_delete": null}'
+
+=====================================================================
+10) ROLLBACK CEPAT
+=====================================================================
+10.1 Rollback jar core indexer
+- sudo cp /usr/share/wazuh-indexer/lib/opensearch-2.19.4.jar.bak-<timestamp> /usr/share/wazuh-indexer/lib/opensearch-2.19.4.jar
+- sudo chown root:wazuh /usr/share/wazuh-indexer/lib/opensearch-2.19.4.jar
+- sudo chmod 0644 /usr/share/wazuh-indexer/lib/opensearch-2.19.4.jar
+- sudo systemctl restart wazuh-indexer
+
+10.2 Rollback package
+- sudo apt install --reinstall wazuh-indexer=<versi-stabil>
+- saat prompt file config, pilih N untuk keep existing config
+
+=====================================================================
+11) RINGKASAN HASIL PRAKTIS
+=====================================================================
+- Backend Kerja-Praktek-Wazuh: optimasi connector/analysisd sudah terintegrasi.
+- wazuh-indexer code-level: adaptive cache admission untuk query kompleks + ultra-kompleks sudah masuk branch kompatibel.
+- Runtime tuning JVM (Xms/Xmx/direct/off pre-touch) memberikan dampak RAM paling terlihat.
+
